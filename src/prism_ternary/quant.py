@@ -146,16 +146,21 @@ class PrismTernaryLinearMethod(LinearMethodBase):
         local = full[start : start + width]
         layer.prism_straddle = -1
         if start % HADAMARD_BLOCK == 0 and width % HADAMARD_BLOCK == 0:
-            signs = local.clone()
+            signs = local
         elif get_tensor_model_parallel_world_size() == 2 and width % HADAMARD_BLOCK == HALF_BLOCK:
             rank = start // width
             layer.prism_straddle = rank
             half = local[width - HALF_BLOCK :] if rank == 0 else local[:HALF_BLOCK]
-            signs = (local[: width - HALF_BLOCK] if rank == 0 else local[HALF_BLOCK:]).clone()
-            layer.register_buffer("half_signs", torch.cat([half, torch.ones(HALF_BLOCK)]))
+            signs = local[: width - HALF_BLOCK] if rank == 0 else local[HALF_BLOCK:]
+            half_signs = torch.ones(HADAMARD_BLOCK, dtype=torch.float32)
+            half_signs[:HALF_BLOCK].copy_(half)
+            layer.register_buffer("half_signs", half_signs)
         else:
             raise ValueError(f"shard [{start}, {start + width}) of width {input_size} breaks hadamard blocks")
-        layer.register_buffer("hadamard_signs", signs.contiguous())
+        # allocate on the default (model-load) device, as upstream does, then copy from the CPU table
+        buf = torch.empty(signs.numel(), dtype=torch.float32)
+        buf.copy_(signs)
+        layer.register_buffer("hadamard_signs", buf)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight, scales = block_layout(layer.weight.data, layer.scales.data)
