@@ -1,4 +1,5 @@
 import base64
+import os
 from typing import Any
 
 import numpy as np
@@ -29,6 +30,9 @@ from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMPa
 
 from prism_ternary.kernels import (
     GROUP,
+    int8_prepare,
+    ternary_linear_q,
+    ternary_matmul_q,
     HADAMARD_BLOCK,
     LANES,
     block_layout,
@@ -38,6 +42,8 @@ from prism_ternary.kernels import (
 )
 
 HALF_BLOCK = HADAMARD_BLOCK // 2
+# Opt-in int8 prefill GEMM (see kernels.int8_matmul). Decode (<=64 rows) is unchanged.
+INT8_PREFILL = os.environ.get("PRISM_INT8_PREFILL", "0") == "1"
 
 QUANT_METHOD = "prism_ternary"
 TERNARY_SUFFIXES = frozenset(
@@ -145,6 +151,7 @@ class PrismTernaryLinearMethod(LinearMethodBase):
         start = 0 if width == input_size else get_tensor_model_parallel_rank() * width
         local = full[start : start + width]
         layer.prism_straddle = -1
+        layer.prism_i8 = False  # set in process_weights_after_loading when PRISM_INT8_PREFILL=1
         if start % HADAMARD_BLOCK == 0 and width % HADAMARD_BLOCK == 0:
             signs = local
         elif get_tensor_model_parallel_world_size() == 2 and width % HADAMARD_BLOCK == HALF_BLOCK:
@@ -166,11 +173,18 @@ class PrismTernaryLinearMethod(LinearMethodBase):
         weight, scales = block_layout(layer.weight.data, layer.scales.data)
         layer.weight = torch.nn.Parameter(weight, requires_grad=False)
         layer.scales = torch.nn.Parameter(scales, requires_grad=False)
+        layer.prism_i8 = INT8_PREFILL
+        if INT8_PREFILL:
+            q, sm127 = int8_prepare(scales)
+            layer.register_buffer("i8_q", q)
+            layer.register_buffer("i8_sm127", sm127)
 
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
-        if layer.prism_straddle < 0:
+        if layer.prism_straddle < 0 and layer.prism_i8:
+            y = ternary_linear_q(x, layer.weight, layer.scales, layer.i8_q, layer.i8_sm127, layer.hadamard_signs)
+        elif layer.prism_straddle < 0:
             y = ternary_linear(x, layer.weight, layer.scales, layer.hadamard_signs)
         else:
             y = self._apply_straddle(layer, x)
@@ -193,7 +207,10 @@ class PrismTernaryLinearMethod(LinearMethodBase):
         ha, hb = both[:, :HALF_BLOCK], both[:, HALF_BLOCK:]
         mixed = (ha + hb if rank == 0 else ha - hb).to(x2.dtype)
         rotated = torch.cat([rotated, mixed] if rank == 0 else [mixed, rotated], dim=1)
-        y = ternary_matmul(rotated, layer.weight, layer.scales)
+        if layer.prism_i8:
+            y = ternary_matmul_q(rotated, layer.weight, layer.scales, layer.i8_q, layer.i8_sm127)
+        else:
+            y = ternary_matmul(rotated, layer.weight, layer.scales)
         return y.reshape(*x.shape[:-1], layer.weight.shape[0])
 
 

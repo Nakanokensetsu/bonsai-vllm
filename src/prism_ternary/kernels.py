@@ -61,6 +61,112 @@ def dequantize(weight: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype) -
     return full
 
 
+# ---- int8 prefill path (opt-in: PRISM_INT8_PREFILL=1) --------------------------------------
+# Group scales are split at load time into a per-row max and an int8 ratio
+#     q[n, g] = round(127 * s[n, g] / smax[n]),
+# so W_int8[n, k] = code[n, k] * q[n, g] is exact int8 and a whole prefill GEMM becomes one cuBLAS
+# int8 GEMM plus a per-row / per-token rescale. Activations are quantized per token to int8 after
+# the Hadamard rotation (which spreads outliers). On RTX 5070 (sm_120, M=512) the linear layers go
+# from 242 ms to 114 ms per step; relative error per layer ~9.5e-3 vs 2.4e-3 for the bf16 path.
+
+
+def int8_prepare(scales: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Blocked fp16 scales [N, G] -> (q: int8 [N, G] in the same blocked order, smax/127: fp32 [N])."""
+    n, groups = scales.shape
+    sb = scales.float().view(n // ROW_BLOCK, groups, ROW_BLOCK)
+    smax = sb.amax(dim=1).clamp_min(1e-12)
+    q = torch.round(127.0 * sb / smax[:, None, :]).clamp_(0, 127).to(torch.int8)
+    return q.view(n, groups).contiguous(), (smax.reshape(n) / 127.0).contiguous()
+
+
+@triton.jit
+def _expand_i8_kernel(w_ptr, q_ptr, out_ptr, groups, stride_on, BLOCK_N: tl.constexpr):
+    pid_n = tl.program_id(0)
+    g = tl.program_id(1)
+    rows = tl.arange(0, BLOCK_N)
+    words = tl.arange(0, 8)
+    lanes = tl.arange(0, 16)
+    w = tl.load(w_ptr + (pid_n * groups + g) * (BLOCK_N * 8) + rows[:, None] * 8 + words[None, :])
+    q = tl.load(q_ptr + (pid_n * groups + g) * BLOCK_N + rows).to(tl.int32)
+    codes = ((w[:, :, None] >> (lanes * 2)[None, None, :]) & 3) - 1
+    offs_n = pid_n * BLOCK_N + rows
+    tl.store(out_ptr + offs_n[:, None, None] * stride_on + g * 128 + (words * 16)[None, :, None] + lanes[None, None, :],
+             (codes * q[:, None, None]).to(tl.int8))
+
+
+@triton.jit
+def _quant_rows_kernel(x_ptr, xq_ptr, xs_ptr, K, stride_x, stride_q, BLOCK_K: tl.constexpr):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_K)
+    amax = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        v = tl.load(x_ptr + row * stride_x + k0 + offs, mask=k0 + offs < K, other=0.0).to(tl.float32)
+        amax = tl.maximum(amax, tl.abs(v))
+    scale = tl.maximum(tl.max(amax, axis=0), 1e-8) / 127.0
+    inv = 1.0 / scale
+    for k0 in range(0, K, BLOCK_K):
+        v = tl.load(x_ptr + row * stride_x + k0 + offs, mask=k0 + offs < K, other=0.0).to(tl.float32) * inv
+        v = tl.where(v >= 0, v + 0.5, v - 0.5).to(tl.int32)
+        v = tl.minimum(tl.maximum(v, -127), 127)
+        tl.store(xq_ptr + row * stride_q + k0 + offs, v.to(tl.int8), mask=k0 + offs < K)
+    tl.store(xs_ptr + row, scale)
+
+
+@triton.jit
+def _rescale_kernel(acc_ptr, xs_ptr, sm_ptr, y_ptr, M, N, stride_a, stride_y, BM: tl.constexpr, BN: tl.constexpr):
+    om = tl.program_id(0) * BM + tl.arange(0, BM)
+    on = tl.program_id(1) * BN + tl.arange(0, BN)
+    mask = (om[:, None] < M) & (on[None, :] < N)
+    a = tl.load(acc_ptr + om[:, None] * stride_a + on[None, :], mask=mask, other=0).to(tl.float32)
+    xs = tl.load(xs_ptr + om, mask=om < M, other=0.0)
+    sm = tl.load(sm_ptr + on, mask=on < N, other=0.0)
+    tl.store(y_ptr + om[:, None] * stride_y + on[None, :], (a * xs[:, None] * sm[None, :]).to(y_ptr.dtype.element_ty), mask=mask)
+
+
+def int8_matmul(rotated: torch.Tensor, weight: torch.Tensor, q: torch.Tensor, sm127: torch.Tensor) -> torch.Tensor:
+    m, k = rotated.shape
+    n = weight.shape[0]
+    groups = k // GROUP
+    wi = torch.empty((n, k), dtype=torch.int8, device=rotated.device)
+    _expand_i8_kernel[(n // ROW_BLOCK, groups)](weight, q, wi, groups, wi.stride(0), BLOCK_N=ROW_BLOCK, num_warps=4)
+    xq = torch.empty((m, k), dtype=torch.int8, device=rotated.device)
+    xs = torch.empty((m,), dtype=torch.float32, device=rotated.device)
+    _quant_rows_kernel[(m,)](rotated, xq, xs, k, rotated.stride(0), xq.stride(0), BLOCK_K=1024, num_warps=4)
+    acc = torch._int_mm(xq, wi.t())
+    y = torch.empty((m, n), dtype=rotated.dtype, device=rotated.device)
+    _rescale_kernel[(triton.cdiv(m, 64), triton.cdiv(n, 128))](acc, xs, sm127, y, m, n, acc.stride(0), y.stride(0),
+                                                               BM=64, BN=128, num_warps=4)
+    return y
+
+
+@torch.library.custom_op("prism_ternary::matmul_q", mutates_args=())
+def ternary_matmul_q(
+    rotated: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, q: torch.Tensor, sm127: torch.Tensor
+) -> torch.Tensor:
+    if rotated.shape[0] <= GEMV_MAX_ROWS:
+        return _cuda().ternary_gemv(rotated, weight, scales)
+    return int8_matmul(rotated.contiguous(), weight, q, sm127)
+
+
+@ternary_matmul_q.register_fake
+def _ternary_matmul_q_fake(rotated, weight, scales, q, sm127):
+    return rotated.new_empty(rotated.shape[0], weight.shape[0])
+
+
+@torch.library.custom_op("prism_ternary::linear_q", mutates_args=())
+def ternary_linear_q(
+    x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, q: torch.Tensor, sm127: torch.Tensor, signs: torch.Tensor
+) -> torch.Tensor:
+    rotated = _cuda().signed_hadamard(x.reshape(-1, x.shape[-1]), signs)
+    y = ternary_matmul_q(rotated, weight, scales, q, sm127)
+    return y.reshape(*x.shape[:-1], weight.shape[0])
+
+
+@ternary_linear_q.register_fake
+def _ternary_linear_q_fake(x, weight, scales, q, sm127, signs):
+    return x.new_empty(*x.shape[:-1], weight.shape[0])
+
+
 @torch.library.custom_op("prism_ternary::hadamard", mutates_args=())
 def signed_hadamard(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
     return _cuda().signed_hadamard(x, signs)
