@@ -3,6 +3,12 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -21,7 +27,17 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 
-from prism_ternary.kernels import GROUP, HADAMARD_BLOCK, LANES, block_layout, ternary_linear
+from prism_ternary.kernels import (
+    GROUP,
+    HADAMARD_BLOCK,
+    LANES,
+    block_layout,
+    signed_hadamard,
+    ternary_linear,
+    ternary_matmul,
+)
+
+HALF_BLOCK = HADAMARD_BLOCK // 2
 
 QUANT_METHOD = "prism_ternary"
 TERNARY_SUFFIXES = frozenset(
@@ -98,8 +114,8 @@ class PrismTernaryLinearMethod(LinearMethodBase):
     ) -> None:
         weight_loader = extra_weight_attrs["weight_loader"]
         rows = sum(output_partition_sizes)
-        if input_size_per_partition % HADAMARD_BLOCK:
-            raise ValueError(f"input width {input_size_per_partition} is not a multiple of {HADAMARD_BLOCK}")
+        if input_size_per_partition % GROUP:
+            raise ValueError(f"input width {input_size_per_partition} is not a multiple of {GROUP}")
         layer.register_parameter(
             "weight",
             PackedvLLMParameter(
@@ -120,9 +136,26 @@ class PrismTernaryLinearMethod(LinearMethodBase):
                 weight_loader=weight_loader,
             ),
         )
-        signs = torch.empty(input_size_per_partition, dtype=torch.float32)
-        signs.copy_(self.quant_config.signs[input_size_per_partition])
-        layer.register_buffer("hadamard_signs", signs)
+        # The rotation is a block-diagonal Hadamard over the *full* input width, so a
+        # row-parallel shard takes its slice of the full sign vector. When the shard
+        # boundary cuts a 1024 block exactly in half (TP=2 on down_proj: 17408 -> 8704),
+        # each rank transforms its half and the two halves are exchanged in apply().
+        full = self.quant_config.signs[input_size]
+        width = input_size_per_partition
+        start = 0 if width == input_size else get_tensor_model_parallel_rank() * width
+        local = full[start : start + width]
+        layer.prism_straddle = -1
+        if start % HADAMARD_BLOCK == 0 and width % HADAMARD_BLOCK == 0:
+            signs = local.clone()
+        elif get_tensor_model_parallel_world_size() == 2 and width % HADAMARD_BLOCK == HALF_BLOCK:
+            rank = start // width
+            layer.prism_straddle = rank
+            half = local[width - HALF_BLOCK :] if rank == 0 else local[:HALF_BLOCK]
+            signs = (local[: width - HALF_BLOCK] if rank == 0 else local[HALF_BLOCK:]).clone()
+            layer.register_buffer("half_signs", torch.cat([half, torch.ones(HALF_BLOCK)]))
+        else:
+            raise ValueError(f"shard [{start}, {start + width}) of width {input_size} breaks hadamard blocks")
+        layer.register_buffer("hadamard_signs", signs.contiguous())
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight, scales = block_layout(layer.weight.data, layer.scales.data)
@@ -132,8 +165,31 @@ class PrismTernaryLinearMethod(LinearMethodBase):
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
-        y = ternary_linear(x, layer.weight, layer.scales, layer.hadamard_signs)
+        if layer.prism_straddle < 0:
+            y = ternary_linear(x, layer.weight, layer.scales, layer.hadamard_signs)
+        else:
+            y = self._apply_straddle(layer, x)
         return y if bias is None else y + bias
+
+    @staticmethod
+    def _apply_straddle(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        # H1024 [a; b] = [Ha + Hb; Ha - Hb] (Sylvester, same 1/32 scale as the kernel).
+        # Rank 0 owns a (its last 512 cols), rank 1 owns b (its first 512 cols).
+        rank = layer.prism_straddle
+        x2 = x.reshape(-1, x.shape[-1])
+        width = x2.shape[1]
+        if rank == 0:
+            aligned, half = x2[:, : width - HALF_BLOCK], x2[:, width - HALF_BLOCK :]
+        else:
+            half, aligned = x2[:, :HALF_BLOCK], x2[:, HALF_BLOCK:]
+        rotated = signed_hadamard(aligned.contiguous(), layer.hadamard_signs)
+        own = signed_hadamard(F.pad(half, (0, HALF_BLOCK)).contiguous(), layer.half_signs)[:, :HALF_BLOCK]
+        both = tensor_model_parallel_all_gather(own.contiguous(), dim=-1).float()
+        ha, hb = both[:, :HALF_BLOCK], both[:, HALF_BLOCK:]
+        mixed = (ha + hb if rank == 0 else ha - hb).to(x2.dtype)
+        rotated = torch.cat([rotated, mixed] if rank == 0 else [mixed, rotated], dim=1)
+        y = ternary_matmul(rotated, layer.weight, layer.scales)
+        return y.reshape(*x.shape[:-1], layer.weight.shape[0])
 
 
 def register() -> None:

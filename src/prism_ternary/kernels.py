@@ -61,6 +61,30 @@ def dequantize(weight: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype) -
     return full
 
 
+@torch.library.custom_op("prism_ternary::hadamard", mutates_args=())
+def signed_hadamard(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
+    return _cuda().signed_hadamard(x, signs)
+
+
+@signed_hadamard.register_fake
+def _signed_hadamard_fake(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@torch.library.custom_op("prism_ternary::matmul", mutates_args=())
+def ternary_matmul(rotated: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    return (
+        _cuda().ternary_gemv(rotated, weight, scales)
+        if rotated.shape[0] <= GEMV_MAX_ROWS
+        else rotated @ dequantize(weight, scales, rotated.dtype).T
+    )
+
+
+@ternary_matmul.register_fake
+def _ternary_matmul_fake(rotated: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    return rotated.new_empty(rotated.shape[0], weight.shape[0])
+
+
 @torch.library.custom_op("prism_ternary::linear", mutates_args=())
 def ternary_linear(
     x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, signs: torch.Tensor
