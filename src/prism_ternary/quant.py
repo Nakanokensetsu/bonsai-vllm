@@ -44,6 +44,7 @@ from prism_ternary.kernels import (
 HALF_BLOCK = HADAMARD_BLOCK // 2
 # Opt-in int8 prefill GEMM (see kernels.int8_matmul). Decode (<=64 rows) is unchanged.
 INT8_PREFILL = os.environ.get("PRISM_INT8_PREFILL", "0") == "1"
+MTP_BF16 = os.environ.get("PRISM_MTP_BF16", "0") == "1"
 
 QUANT_METHOD = "prism_ternary"
 TERNARY_SUFFIXES = frozenset(
@@ -92,7 +93,11 @@ class PrismTernaryConfig(QuantizationConfig):
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> QuantizeMethodBase | None:
         if prefix.startswith("mtp."):
-            return Fp8PerTensorOnlineLinearMethod() if isinstance(layer, LinearBase) else None
+            # The MTP head ships in bf16. Upstream quantizes it to fp8 online; PRISM_MTP_BF16=1 keeps
+            # it in bf16 (about +0.2 GB per GPU) in case fp8 costs draft acceptance.
+            if not isinstance(layer, LinearBase):
+                return None
+            return UnquantizedLinearMethod() if MTP_BF16 else Fp8PerTensorOnlineLinearMethod()
         if isinstance(layer, ParallelLMHead):
             return PrismTernaryLinearMethod(self)
         if isinstance(layer, LinearBase):
