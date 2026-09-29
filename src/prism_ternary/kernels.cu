@@ -225,6 +225,105 @@ __global__ void __launch_bounds__(kHadamardThreads) signed_hadamard_kernel(
     }
 }
 
+
+// ---- batched int8 dp4a GEMV (opt-in PRISM_DP4A_DECODE=1; idea from bonsai-turbo, Apache-2.0) ----
+constexpr int kDp4aGroup = 128;
+constexpr int kDp4aMaxB = 8;
+constexpr int kDp4aWarps = 8;
+
+__device__ __forceinline__ int dp4a_u8s8(uint32_t codes, uint32_t acts, int acc) {
+    asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(acc) : "r"(codes), "r"(acts), "r"(acc));
+    return acc;
+}
+
+// One warp per (row b, 128-group g). Output bytes of a group are in dp4a order:
+// for word j (codes 16j..16j+15) and step i: bytes a[16j+i], a[16j+4+i], a[16j+8+i], a[16j+12+i].
+__global__ void quant_acts_kernel(const __nv_bfloat16* __restrict__ x, int K, int groups,
+                                  int8_t* __restrict__ xq, float* __restrict__ xs,
+                                  int* __restrict__ gsum) {
+    const int b = blockIdx.y;
+    const int g = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (g >= groups) return;
+    const int lane = threadIdx.x & 31;
+    const __nv_bfloat16* xr = x + (size_t)b * K + g * kDp4aGroup;
+    float v[4];
+    float amax = 0.f;
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        v[t] = __bfloat162float(xr[lane * 4 + t]);
+        amax = fmaxf(amax, fabsf(v[t]));
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    const float s = fmaxf(amax, 1e-8f) / 127.f;
+    const float inv = 1.f / s;
+    int lsum = 0;
+    int8_t* out = xq + (size_t)b * K + g * kDp4aGroup;
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        const int k = lane * 4 + t;               // position inside the group
+        int q = __float2int_rn(v[t] * inv);
+        q = max(-127, min(127, q));
+        lsum += q;
+        const int j = k >> 4, l = k & 15;         // word j, code l in the word
+        const int i = l & 3, byte = l >> 2;       // dp4a step i, byte lane
+        out[j * 16 + i * 4 + byte] = (int8_t)q;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) lsum += __shfl_xor_sync(0xffffffffu, lsum, off);
+    if (lane == 0) {
+        xs[b * groups + g] = s;
+        gsum[b * groups + g] = lsum;
+    }
+}
+
+template <int B>
+__global__ void __launch_bounds__(kDp4aWarps * 32) gemv_dp4a_kernel(
+    const uint32_t* __restrict__ w, const __half* __restrict__ ws,
+    const int8_t* __restrict__ xq, const float* __restrict__ xs, const int* __restrict__ gsum,
+    __nv_bfloat16* __restrict__ y, int N, int K, int groups) {
+    const int rb = blockIdx.x;                    // row block of 32 rows
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;            // row inside the block
+    float acc[B];
+#pragma unroll
+    for (int b = 0; b < B; ++b) acc[b] = 0.f;
+    for (int g = warp; g < groups; g += kDp4aWarps) {
+        const size_t slot = ((size_t)rb * groups + g) * 32 + lane;
+        const uint4* wp = reinterpret_cast<const uint4*>(w + slot * 8);
+        const uint4 w0 = wp[0], w1 = wp[1];
+        const uint32_t words[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+        const float wscale = __half2float(ws[slot]);
+#pragma unroll
+        for (int b = 0; b < B; ++b) {
+            const uint32_t* ap = reinterpret_cast<const uint32_t*>(xq + (size_t)b * K + g * kDp4aGroup);
+            int dot = 0;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const uint4 a = reinterpret_cast<const uint4*>(ap)[j];   // broadcast across lanes
+                dot = dp4a_u8s8(words[j] & 0x03030303u, a.x, dot);
+                dot = dp4a_u8s8((words[j] >> 2) & 0x03030303u, a.y, dot);
+                dot = dp4a_u8s8((words[j] >> 4) & 0x03030303u, a.z, dot);
+                dot = dp4a_u8s8((words[j] >> 6) & 0x03030303u, a.w, dot);
+            }
+            acc[b] += wscale * xs[b * groups + g] * (float)(dot - gsum[b * groups + g]);
+        }
+    }
+    __shared__ float red[kDp4aWarps][32][B];
+#pragma unroll
+    for (int b = 0; b < B; ++b) red[warp][lane][b] = acc[b];
+    __syncthreads();
+    if (warp == 0) {
+#pragma unroll
+        for (int b = 0; b < B; ++b) {
+            float s = 0.f;
+#pragma unroll
+            for (int ww = 0; ww < kDp4aWarps; ++ww) s += red[ww][lane][b];
+            y[(size_t)b * N + rb * 32 + lane] = __float2bfloat16(s);
+        }
+    }
+}
+
 }  // namespace
 
 torch::Tensor signed_hadamard(torch::Tensor x, torch::Tensor signs) {
@@ -279,7 +378,46 @@ torch::Tensor ternary_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor s) {
     return y;
 }
 
+std::vector<torch::Tensor> quant_acts(torch::Tensor x) {
+    TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kBFloat16 && x.is_contiguous());
+    const int B = x.size(0), K = x.size(1), groups = K / kDp4aGroup;
+    TORCH_CHECK(K % kDp4aGroup == 0);
+    auto xq = torch::empty({B, K}, x.options().dtype(torch::kInt8));
+    auto xs = torch::empty({B, groups}, x.options().dtype(torch::kFloat32));
+    auto gs = torch::empty({B, groups}, x.options().dtype(torch::kInt32));
+    dim3 grid((groups + 7) / 8, B);
+    quant_acts_kernel<<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), K, groups, xq.data_ptr<int8_t>(),
+        xs.data_ptr<float>(), gs.data_ptr<int>());
+    return {xq, xs, gs};
+}
+
+torch::Tensor gemv_dp4a(torch::Tensor xq, torch::Tensor xs, torch::Tensor gs, torch::Tensor w, torch::Tensor ws) {
+    const int B = xq.size(0), K = xq.size(1), N = w.size(0), groups = K / kDp4aGroup;
+    TORCH_CHECK(B >= 1 && B <= kDp4aMaxB && N % 32 == 0);
+    auto y = torch::empty({B, N}, xq.options().dtype(torch::kBFloat16));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const auto* wp = reinterpret_cast<const uint32_t*>(w.data_ptr<int32_t>());
+    const auto* sp = reinterpret_cast<const __half*>(ws.data_ptr());
+    auto* yp = reinterpret_cast<__nv_bfloat16*>(y.data_ptr());
+#define LAUNCH(NB) gemv_dp4a_kernel<NB><<<N / 32, kDp4aWarps * 32, 0, stream>>>(wp, sp, xq.data_ptr<int8_t>(), xs.data_ptr<float>(), gs.data_ptr<int>(), yp, N, K, groups)
+    switch (B) {  // exact batch per instantiation: rows beyond B are never read or written
+        case 1: LAUNCH(1); break;
+        case 2: LAUNCH(2); break;
+        case 3: LAUNCH(3); break;
+        case 4: LAUNCH(4); break;
+        case 5: LAUNCH(5); break;
+        case 6: LAUNCH(6); break;
+        case 7: LAUNCH(7); break;
+        default: LAUNCH(8); break;
+    }
+#undef LAUNCH
+    return y;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ternary_gemv", &ternary_gemv, "ternary 2-bit gemm for <=64 rows (bf16 activations, tensor cores, blocked weight layout)");
+    m.def("dp4a_quant_acts", &quant_acts, "per-128-group int8 activations in dp4a byte order");
+    m.def("dp4a_gemv", &gemv_dp4a, "batched (<=8 rows) int8 dp4a GEMV over the blocked 2-bit layout");
     m.def("signed_hadamard", &signed_hadamard, "blockwise signed Walsh-Hadamard transform (block 1024)");
 }

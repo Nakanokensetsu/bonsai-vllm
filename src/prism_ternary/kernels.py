@@ -13,6 +13,10 @@ LANES = 16
 WORDS_PER_GROUP = GROUP // LANES
 ROW_BLOCK = 32
 GEMV_MAX_ROWS = 64
+# Decode batches up to this many rows use the int8 dp4a GEMV when PRISM_DP4A_DECODE=1
+# (RTX 5070: 2.1x at 1 row, 1.7x at 2, 1.3x at 4, slower at 8; per-layer error 1.7e-3 -> 6.7e-3).
+DP4A_MAX_ROWS = 4
+DP4A_DECODE = __import__("os").environ.get("PRISM_DP4A_DECODE", "0") == "1"
 
 
 @cache
@@ -144,7 +148,7 @@ def ternary_matmul_q(
     rotated: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, q: torch.Tensor, sm127: torch.Tensor
 ) -> torch.Tensor:
     if rotated.shape[0] <= GEMV_MAX_ROWS:
-        return _cuda().ternary_gemv(rotated, weight, scales)
+        return _small_batch_gemv(rotated, weight, scales)
     return int8_matmul(rotated.contiguous(), weight, q, sm127)
 
 
@@ -177,10 +181,17 @@ def _signed_hadamard_fake(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(x)
 
 
+def _small_batch_gemv(rotated: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    if DP4A_DECODE and rotated.shape[0] <= DP4A_MAX_ROWS:
+        xq, xs, gs = _cuda().dp4a_quant_acts(rotated.contiguous())
+        return _cuda().dp4a_gemv(xq, xs, gs, weight, scales)
+    return _cuda().ternary_gemv(rotated, weight, scales)
+
+
 @torch.library.custom_op("prism_ternary::matmul", mutates_args=())
 def ternary_matmul(rotated: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     return (
-        _cuda().ternary_gemv(rotated, weight, scales)
+        _small_batch_gemv(rotated, weight, scales)
         if rotated.shape[0] <= GEMV_MAX_ROWS
         else rotated @ dequantize(weight, scales, rotated.dtype).T
     )
@@ -197,7 +208,7 @@ def ternary_linear(
 ) -> torch.Tensor:
     rotated = _cuda().signed_hadamard(x.reshape(-1, x.shape[-1]), signs)
     y = (
-        _cuda().ternary_gemv(rotated, weight, scales)
+        _small_batch_gemv(rotated, weight, scales)
         if rotated.shape[0] <= GEMV_MAX_ROWS
         else rotated @ dequantize(weight, scales, rotated.dtype).T
     )
