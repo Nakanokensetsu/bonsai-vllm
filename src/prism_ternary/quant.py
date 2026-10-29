@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
 )
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -109,6 +108,27 @@ class PrismTernaryConfig(QuantizationConfig):
         return UnquantizedEmbeddingMethod() if isinstance(layer, VocabParallelEmbedding) else None
 
 
+def _with_neighbour_columns(layer: torch.nn.Module, inner):
+    """Wrap a weight loader so a straddling layer also keeps the other rank's 512 boundary columns.
+
+    The loader is handed the full on-disk tensor, so the neighbour's slice is just another narrow().
+    """
+
+    def load(param, loaded_weight, *args, **kwargs):
+        inner(param, loaded_weight, *args, **kwargs)
+        rank = layer.prism_straddle
+        if rank < 0:
+            return
+        if param is layer.weight:
+            size, per = param.data.shape[1], HALF_BLOCK // LANES
+            layer.weight_x.copy_(loaded_weight.narrow(1, size if rank == 0 else size - per, per))
+        elif param is layer.scales:
+            size, per = param.data.shape[1], HALF_BLOCK // GROUP
+            layer.scales_x.copy_(loaded_weight.narrow(1, size if rank == 0 else size - per, per))
+
+    return load
+
+
 class PrismTernaryLinearMethod(LinearMethodBase):
     def __init__(self, quant_config: PrismTernaryConfig) -> None:
         self.quant_config = quant_config
@@ -123,7 +143,7 @@ class PrismTernaryLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs: Any,
     ) -> None:
-        weight_loader = extra_weight_attrs["weight_loader"]
+        weight_loader = _with_neighbour_columns(layer, extra_weight_attrs["weight_loader"])
         rows = sum(output_partition_sizes)
         if input_size_per_partition % GROUP:
             raise ValueError(f"input width {input_size_per_partition} is not a multiple of {GROUP}")
@@ -167,6 +187,8 @@ class PrismTernaryLinearMethod(LinearMethodBase):
             half_signs = torch.ones(HADAMARD_BLOCK, dtype=torch.float32)
             half_signs[:HALF_BLOCK].copy_(half)
             layer.register_buffer("half_signs", half_signs)
+            layer.register_buffer("weight_x", torch.empty(rows, HALF_BLOCK // LANES, dtype=torch.int32))
+            layer.register_buffer("scales_x", torch.empty(rows, HALF_BLOCK // GROUP, dtype=torch.float16))
         else:
             raise ValueError(f"shard [{start}, {start + width}) of width {input_size} breaks hadamard blocks")
         # allocate on the default (model-load) device, as upstream does, then copy from the CPU table
@@ -183,6 +205,12 @@ class PrismTernaryLinearMethod(LinearMethodBase):
             q, sm127 = int8_prepare(scales)
             layer.register_buffer("i8_q", q)
             layer.register_buffer("i8_sm127", sm127)
+        if layer.prism_straddle >= 0:
+            layer.weight_x, layer.scales_x = block_layout(layer.weight_x.data, layer.scales_x.data)
+            if INT8_PREFILL:
+                qx, smx = int8_prepare(layer.scales_x)
+                layer.register_buffer("i8_qx", qx)
+                layer.register_buffer("i8_sm127x", smx)
 
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
@@ -197,8 +225,12 @@ class PrismTernaryLinearMethod(LinearMethodBase):
 
     @staticmethod
     def _apply_straddle(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
-        # H1024 [a; b] = [Ha + Hb; Ha - Hb] (Sylvester, same 1/32 scale as the kernel).
-        # Rank 0 owns a (its last 512 cols), rank 1 owns b (its first 512 cols).
+        # The 1024 block that the shard boundary cuts is H1024 [a; b] = [Ha + Hb; Ha - Hb] (Sylvester),
+        # a on rank 0 (its last 512 cols), b on rank 1 (its first 512). Instead of exchanging Ha / Hb,
+        # each rank feeds its own half-transform into the local product with the sign its column block
+        # sees (+Ha for rank 0, -Hb for rank 1) and adds the neighbour's boundary columns times its own
+        # half-transform (W_B Ha on rank 0, W_A Hb on rank 1). The all-reduce that follows sums both ranks
+        # to exactly W (Ha + Hb) + W (Ha - Hb) cut at the boundary, with no collective of its own.
         rank = layer.prism_straddle
         x2 = x.reshape(-1, x.shape[-1])
         width = x2.shape[1]
@@ -208,14 +240,13 @@ class PrismTernaryLinearMethod(LinearMethodBase):
             half, aligned = x2[:, :HALF_BLOCK], x2[:, HALF_BLOCK:]
         rotated = signed_hadamard(aligned.contiguous(), layer.hadamard_signs)
         own = signed_hadamard(F.pad(half, (0, HALF_BLOCK)).contiguous(), layer.half_signs)[:, :HALF_BLOCK]
-        both = tensor_model_parallel_all_gather(own.contiguous(), dim=-1).float()
-        ha, hb = both[:, :HALF_BLOCK], both[:, HALF_BLOCK:]
-        mixed = (ha + hb if rank == 0 else ha - hb).to(x2.dtype)
-        rotated = torch.cat([rotated, mixed] if rank == 0 else [mixed, rotated], dim=1)
+        local = torch.cat([rotated, own] if rank == 0 else [-own, rotated], dim=1)
         if layer.prism_i8:
-            y = ternary_matmul_q(rotated, layer.weight, layer.scales, layer.i8_q, layer.i8_sm127)
+            y = ternary_matmul_q(local, layer.weight, layer.scales, layer.i8_q, layer.i8_sm127)
+            y = y + ternary_matmul_q(own.contiguous(), layer.weight_x, layer.scales_x, layer.i8_qx, layer.i8_sm127x)
         else:
-            y = ternary_matmul(rotated, layer.weight, layer.scales)
+            y = ternary_matmul(local, layer.weight, layer.scales)
+            y = y + ternary_matmul(own.contiguous(), layer.weight_x, layer.scales_x)
         return y.reshape(*x.shape[:-1], layer.weight.shape[0])
 
 
