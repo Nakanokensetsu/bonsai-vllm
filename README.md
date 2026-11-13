@@ -1,5 +1,14 @@
 # bonsai-vllm
 
+> **This is a fork (branch `bonsai-tp2-wsl`).** It adds, on top of [fraserprice/bonsai-vllm](https://github.com/fraserprice/bonsai-vllm):
+> - tensor parallel 2 (`--tensor-parallel-size 2`), including `down_proj` shards that split a Hadamard block, without an extra all_gather
+> - `PRISM_INT8_PREFILL=1`: int8 GEMM for prefill
+> - `PRISM_MTP_BF16=1`: keep the MTP head in bf16
+> - `PRISM_DP4A_DECODE=1`: dp4a GEMV for decode batches of <=4 rows
+> - `PRISM_AR_INT8=1`: int8 all-reduce for TP=2 prefill (Triton pack/unpack)
+>
+> Tested on 2x RTX 5070 12GB under WSL2 with vLLM 0.32.0. Full setup (vLLM patch, scripts): [Nakanokensetsu/bonsai-27b-wsl-tp2](https://github.com/Nakanokensetsu/bonsai-27b-wsl-tp2)
+
 > **Work in progress.** Expect rough edges and breaking changes.
 
 Serves [Bonsai 2 27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit), Prism ML's ternary Qwen3.8-27B, on vLLM with custom CUDA kernels. Unofficial; not affiliated with Prism ML.
