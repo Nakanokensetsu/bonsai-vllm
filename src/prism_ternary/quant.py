@@ -251,4 +251,7 @@ class PrismTernaryLinearMethod(LinearMethodBase):
 
 
 def register() -> None:
-    return None
+    # PRISM_AR_INT8=1: TP=2 の prefill AllReduce を int8 で交換(既定は無効)。記録: notes/20261029-tp-opt/README.md §8,10 / 2026-11-03 Triton 化
+    from prism_ternary import ar_int8
+    if ar_int8.ENABLED:
+        ar_int8.patch_vllm()
