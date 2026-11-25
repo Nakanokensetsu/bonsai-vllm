@@ -17,6 +17,10 @@ GEMV_MAX_ROWS = 64
 # (RTX 5070: 2.1x at 1 row, 1.7x at 2, 1.3x at 4, slower at 8; per-layer error 1.7e-3 -> 6.7e-3).
 DP4A_MAX_ROWS = 4
 DP4A_DECODE = __import__("os").environ.get("PRISM_DP4A_DECODE", "0") == "1"
+# int8 prefill for small chunks (65..N rows): unpack the 2-bit codes inside the GEMM instead of
+# expanding the whole weight to int8 first. Bit-identical to int8_matmul. On RTX 5070 (sm_120):
+# 1.4-1.9x at <=128 rows, 1.0-1.2x at 256-384 rows, slower from 512 rows. 0 = off.
+FUSED_I8_MAX_ROWS = int(__import__("os").environ.get("PRISM_FUSED_I8_MAX", "0"))
 
 
 @cache
@@ -143,12 +147,51 @@ def int8_matmul(rotated: torch.Tensor, weight: torch.Tensor, q: torch.Tensor, sm
     return y
 
 
+@triton.jit
+def _fused_i8_kernel(xq_ptr, w_ptr, q_ptr, acc_ptr, M, N, KK, groups, BM: tl.constexpr, BN: tl.constexpr):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    om = pid_m * BM + tl.arange(0, BM)
+    on = pid_n * BN + tl.arange(0, BN)
+    rb = on // 32
+    row = on % 32
+    words = tl.arange(0, 8)
+    lanes = tl.arange(0, 16)
+    kk = tl.arange(0, 128)
+    acc = tl.zeros((BM, BN), tl.int32)
+    for g in range(0, groups):
+        x = tl.load(xq_ptr + om[:, None] * KK + g * 128 + kk[None, :], mask=om[:, None] < M, other=0)
+        w = tl.load(w_ptr + ((rb * groups + g) * 32 + row)[:, None] * 8 + words[None, :])
+        q = tl.load(q_ptr + (rb * groups + g) * 32 + row).to(tl.int32)
+        c = ((w[:, :, None] >> (lanes * 2)[None, None, :]) & 3) - 1
+        c = tl.reshape(c, (BN, 128)) * q[:, None]
+        acc += tl.dot(x, tl.trans(c.to(tl.int8)))
+    tl.store(acc_ptr + om[:, None] * N + on[None, :], acc, mask=om[:, None] < M)
+
+
+def fused_int8_matmul(rotated: torch.Tensor, weight: torch.Tensor, q: torch.Tensor, sm127: torch.Tensor) -> torch.Tensor:
+    m, k = rotated.shape
+    n = weight.shape[0]
+    xq = torch.empty((m, k), dtype=torch.int8, device=rotated.device)
+    xs = torch.empty((m,), dtype=torch.float32, device=rotated.device)
+    _quant_rows_kernel[(m,)](rotated, xq, xs, k, rotated.stride(0), xq.stride(0), BLOCK_K=1024, num_warps=4)
+    acc = torch.empty((m, n), dtype=torch.int32, device=rotated.device)
+    _fused_i8_kernel[(triton.cdiv(m, 128), n // 64)](xq, weight, q, acc, m, n, k, k // GROUP, BM=128, BN=64,
+                                                     num_warps=4, num_stages=3)
+    y = torch.empty((m, n), dtype=rotated.dtype, device=rotated.device)
+    _rescale_kernel[(triton.cdiv(m, 64), triton.cdiv(n, 128))](acc, xs, sm127, y, m, n, acc.stride(0), y.stride(0),
+                                                               BM=64, BN=128, num_warps=4)
+    return y
+
+
 @torch.library.custom_op("prism_ternary::matmul_q", mutates_args=())
 def ternary_matmul_q(
     rotated: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, q: torch.Tensor, sm127: torch.Tensor
 ) -> torch.Tensor:
     if rotated.shape[0] <= GEMV_MAX_ROWS:
         return _small_batch_gemv(rotated, weight, scales)
+    if rotated.shape[0] <= FUSED_I8_MAX_ROWS and weight.shape[0] % 64 == 0:
+        return fused_int8_matmul(rotated.contiguous(), weight, q, sm127)
     return int8_matmul(rotated.contiguous(), weight, q, sm127)
 
 

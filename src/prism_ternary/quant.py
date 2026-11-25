@@ -44,6 +44,18 @@ HALF_BLOCK = HADAMARD_BLOCK // 2
 # Opt-in int8 prefill GEMM (see kernels.int8_matmul). Decode (<=64 rows) is unchanged.
 INT8_PREFILL = os.environ.get("PRISM_INT8_PREFILL", "0") == "1"
 MTP_BF16 = os.environ.get("PRISM_MTP_BF16", "0") == "1"
+# Small bf16 linears (GDN in_proj_ba, 5120 -> 48 per rank): with a row-major weight cuBLAS picks a
+# 4-CTA kernel at 2-8 rows (~20 us); a column-major copy of the same values runs in ~4 us.
+BA_COLMAJOR = os.environ.get("PRISM_BA_COLMAJOR", "0") == "1"
+COLMAJOR_SUFFIXES = frozenset({"in_proj_ba"})
+
+
+class ColMajorUnquantizedLinearMethod(UnquantizedLinearMethod):
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        w = layer.weight.data
+        if not getattr(layer, "use_skinny_gemm", False) and w.ndim == 2 and w.is_cuda and w.stride(1) == 1:
+            layer.weight.data = w.t().contiguous().t()
 
 QUANT_METHOD = "prism_ternary"
 TERNARY_SUFFIXES = frozenset(
@@ -100,11 +112,12 @@ class PrismTernaryConfig(QuantizationConfig):
         if isinstance(layer, ParallelLMHead):
             return PrismTernaryLinearMethod(self)
         if isinstance(layer, LinearBase):
-            return (
-                PrismTernaryLinearMethod(self)
-                if prefix.rsplit(".", 1)[-1] in TERNARY_SUFFIXES
-                else UnquantizedLinearMethod()
-            )
+            suffix = prefix.rsplit(".", 1)[-1]
+            if suffix in TERNARY_SUFFIXES:
+                return PrismTernaryLinearMethod(self)
+            if BA_COLMAJOR and suffix in COLMAJOR_SUFFIXES:
+                return ColMajorUnquantizedLinearMethod()
+            return UnquantizedLinearMethod()
         return UnquantizedEmbeddingMethod() if isinstance(layer, VocabParallelEmbedding) else None
 
 
